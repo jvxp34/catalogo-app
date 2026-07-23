@@ -1,0 +1,154 @@
+# .github/workflows/ci.yml
+# Pipeline de integracao continua: lint, testes e build da imagem Docker
+
+name: CI
+
+# Gatilhos do pipeline — aqui estao varios exemplos de "on" possiveis,
+# a maioria comentada. Deixamos ativos push (qualquer branch) e
+# pull_request, que sao os dois gatilhos que este curso usa de fato.
+on:
+  # Roda a cada push, em QUALQUER branch (nao so na main) —
+  # util para pegar erro cedo, antes mesmo de abrir o pull request
+  push:
+    branches: ["**"]
+
+  # Roda quando um pull request e aberto, recebe novos commits,
+  # ou e reaberto, tendo como alvo qualquer branch do repositorio —
+  # é o que garante que o codigo é validado antes do merge
+  pull_request:
+    branches: ["**"]
+    types: [opened, synchronize, reopened]
+
+  # Exemplo: permite disparar o pipeline manualmente pela aba
+  # Actions do GitHub, sem precisar de push ou pull request
+  # workflow_dispatch:
+
+  # Exemplo: roda o pipeline em um horario agendado (cron),
+  # como uma checagem periodica independente de mudanca no codigo
+  # schedule:
+  #   - cron: "0 6 * * 1"  # toda segunda-feira as 06:00 UTC
+
+  # Exemplo: roda quando uma release e publicada no repositorio,
+  # util para pipelines que fazem deploy apenas em versoes marcadas
+  # release:
+  #   types: [published]
+
+  # Exemplo: roda quando uma tag no padrao vX.Y.Z e enviada,
+  # outra forma comum de disparar builds de versao
+  # push:
+  #   tags: ["v*.*.*"]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    env:
+      POSTGRES_DB: catalogo
+      POSTGRES_USER: postgres_user
+      POSTGRES_PASSWORD: postgres_pass
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      SECRET_KEY: chave-secreta-apenas-para-ci-nao-usar-em-producao
+      DEBUG: "True"
+      ALLOWED_HOSTS: "localhost,127.0.0.1"
+
+    # Sobe um PostgreSQL temporario para os testes de integracao —
+    # sem isso, o pytest-django nao consegue criar o banco de teste
+    # e o job falha mesmo com o codigo correto
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: catalogo
+          POSTGRES_USER: postgres_user
+          POSTGRES_PASSWORD: postgres_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      # Copia o codigo do repositorio para dentro do runner do GitHub Actions —
+      # sem esse step nao existe codigo nenhum disponivel nos proximos steps
+      - name: Faz checkout do codigo
+        uses: actions/checkout@v4
+
+      # Instala o uv (gerenciador de dependencias Python usado no curso)
+      # dentro do runner, disponibilizando o comando `uv` para os steps seguintes
+      - name: Instala o uv
+        uses: astral-sh/setup-uv@v3
+
+      # Le o pyproject.toml/uv.lock do backend e instala as dependencias
+      # (Django, DRF, pytest, ruff etc.) em um ambiente isolado do runner
+      - name: Instala as dependencias do backend
+        run: uv sync
+        working-directory: backend
+
+      # Roda o linter ruff sobre todo o backend; falha o job se encontrar
+      # codigo fora do padrao (imports nao usados, linha longa, etc.)
+      - name: Verifica o estilo do codigo com ruff
+        run: uv run ruff check .
+        working-directory: backend
+
+      # `manage.py check` valida a configuracao do Django (models, settings,
+      # apps instalados) sem precisar de banco de dados — pega erro de
+      # configuracao antes mesmo de chegar nos testes
+      - name: Verifica a configuracao do Django
+        run: uv run python manage.py check
+        working-directory: backend
+
+      # Roda em modo --dry-run: nao cria nenhuma migration de fato, só avisa
+      # se falta gerar uma. Falha o pipeline quando um model foi alterado e
+      # o desenvolvedor esqueceu de rodar `makemigrations` localmente
+      - name: Verifica se as migrations estao sincronizadas com os models
+        run: uv run python manage.py makemigrations --check --dry-run
+        working-directory: backend
+
+      # Aplica as migrations de verdade contra o Postgres do serviço acima,
+      # confirmando que elas rodam sem erro num banco limpo — diferente do
+      # banco de teste que o pytest-django cria e destroi por conta propria
+      - name: Aplica as migrations no banco de dados
+        run: uv run python manage.py migrate
+        working-directory: backend
+
+      # Executa a suite de testes automatizados (pytest + pytest-django)
+      # contra o banco ja migrado; é o ultimo — e mais demorado — checkpoint
+      # antes de considerar o codigo pronto para virar imagem
+      - name: Executa os testes automatizados
+        run: uv run pytest
+        working-directory: backend
+
+  build-and-push:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Job novo roda em uma maquina (runner) limpa e separada da anterior,
+      # entao o codigo precisa ser baixado de novo aqui
+      - name: Faz checkout do codigo
+        uses: actions/checkout@v4
+
+      # Autentica no GitHub Container Registry usando o proprio ator do
+      # workflow (github.actor) e um token temporario gerado automaticamente
+      # pelo GitHub (secrets.GITHUB_TOKEN) — nao é preciso criar segredo manual
+      - name: Autentica no GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Builda a imagem Docker do backend a partir do Dockerfile em ./backend
+      # e, com push: true, envia (`docker push`) o resultado direto para o
+      # ghcr.io com a tag `backend:latest`
+      - name: Constroi e publica a imagem do backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: ghcr.io/${{ github.repository }}/backend:latest
